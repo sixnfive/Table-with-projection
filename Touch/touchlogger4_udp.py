@@ -4,6 +4,7 @@ import math
 import traceback
 import socket
 import struct
+import argparse
 import win32con
 import win32gui
 
@@ -25,8 +26,17 @@ UDP_IP = "127.0.0.1"
 UDP_PORT = 5005
 UDP_ENABLED = True
 
-# Optional coordinate correction applied to UDP only.
-# 1.0 = no correction. Use 16/9 if you need the same horizontal unsqueeze.
+# Physical remap. Units can be mm, cm, inches, whatever — just be consistent.
+# If the touch frame is larger than the visible screen and top-left aligned,
+# corrected_norm = windows_norm * frame_size / screen_size.
+PHYSICAL_REMAP_ENABLED = False
+SCREEN_PHYS_W = 1.0
+SCREEN_PHYS_H = 1.0
+FRAME_PHYS_W = 1.0
+FRAME_PHYS_H = 1.0
+
+# Optional legacy squeeze correction applied after physical remap.
+# Normally leave these at 1.0 when using physical remap.
 UDP_X_SQUEEZE = 1.0
 UDP_Y_SQUEEZE = 1.0
 
@@ -89,6 +99,22 @@ def squeeze01(v, amount):
     return 0.5 + (v - 0.5) * amount
 
 
+def apply_coordinate_correction(nx, ny):
+    """Convert Windows-normalized coords to physical-screen-normalized coords.
+
+    Windows is assuming the whole touch frame maps to the active display.
+    If the real visible screen is smaller/larger than the frame, and both
+    top-left corners are aligned, multiply by frame/screen.
+    """
+    if PHYSICAL_REMAP_ENABLED:
+        nx = nx * (FRAME_PHYS_W / max(1e-9, SCREEN_PHYS_W))
+        ny = ny * (FRAME_PHYS_H / max(1e-9, SCREEN_PHYS_H))
+
+    nx = squeeze01(nx, UDP_X_SQUEEZE)
+    ny = squeeze01(ny, UDP_Y_SQUEEZE)
+    return nx, ny
+
+
 def send_udp_objects():
     if not UDP_ENABLED:
         return
@@ -100,12 +126,10 @@ def send_udp_objects():
     packet = struct.pack("<B", len(touches))
 
     for tid, t in touches:
-        # active_touches stores screen-space pixel coords as "x" and "y"
+        # active_touches stores Windows screen-space pixel coords as "x" and "y".
         nx = t["x"] / max(1, screen_w)
         ny = t["y"] / max(1, screen_h)
-
-        nx = squeeze01(nx, UDP_X_SQUEEZE)
-        ny = squeeze01(ny, UDP_Y_SQUEEZE)
+        nx, ny = apply_coordinate_correction(nx, ny)
 
         rotation = 0.0
 
@@ -121,7 +145,6 @@ def send_udp_objects():
         udp_sock.sendto(packet, (UDP_IP, UDP_PORT))
     except OSError as e:
         print(f"UDP send failed: {e}")
-
 
 def set_capture_enabled(enabled):
     global capture_enabled
@@ -186,9 +209,12 @@ def get_render_dots(hwnd):
     dots = []
 
     for tid, t in active_touches.items():
-        nx = max(0.0, min(1.0, t["x"] / max(1, screen_w)))
-        ny = max(0.0, min(1.0, t["y"] / max(1, screen_h)))
+        nx = t["x"] / max(1, screen_w)
+        ny = t["y"] / max(1, screen_h)
+        nx, ny = apply_coordinate_correction(nx, ny)
 
+        # Intentionally unclamped: if the physical frame extends beyond the screen,
+        # touches outside the screen area can go outside the debug window too.
         x = nx * client_w
         y = ny * client_h
 
@@ -206,16 +232,37 @@ def get_render_dots(hwnd):
 
 def capture_wnd_proc(hwnd, msg, wparam, lparam):
     try:
+
         if msg == WM_TOUCH:
+
             count = wparam & 0xFFFF
+
             inputs = (TOUCHINPUT * count)()
 
-            ok = GetTouchInputInfo(lparam, count, inputs, ctypes.sizeof(TOUCHINPUT))
+            ok = GetTouchInputInfo(
+                lparam,
+                count,
+                inputs,
+                ctypes.sizeof(TOUCHINPUT)
+            )
+
             if ok:
+
+                # update all touches first
                 for ti in inputs:
                     update_touch(ti)
 
+                # debug what Windows actually delivered
+                print(
+                    f"frame count={count} "
+                    f"active={list(active_touches.keys())}"
+                )
+
+                # send ONE udp packet per frame
+                send_udp_objects()
+
             CloseTouchInputHandle(lparam)
+
             return 0
 
         return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
@@ -398,8 +445,57 @@ def create_render_window():
     return hwnd
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Fullscreen Windows touch capture/debugger with UDP output."
+    )
+    parser.add_argument("--udp-ip", default=UDP_IP)
+    parser.add_argument("--udp-port", type=int, default=UDP_PORT)
+    parser.add_argument("--no-udp", action="store_true")
+
+    parser.add_argument(
+        "--screen-phys", nargs=2, type=float, metavar=("W", "H"),
+        help="Physical visible screen size, e.g. --screen-phys 344 194"
+    )
+    parser.add_argument(
+        "--frame-phys", nargs=2, type=float, metavar=("W", "H"),
+        help="Physical touch-frame active size, same units as --screen-phys"
+    )
+    parser.add_argument(
+        "--x-squeeze", type=float, default=UDP_X_SQUEEZE,
+        help="Legacy center-based X squeeze applied after physical remap. Default 1.0"
+    )
+    parser.add_argument(
+        "--y-squeeze", type=float, default=UDP_Y_SQUEEZE,
+        help="Legacy center-based Y squeeze applied after physical remap. Default 1.0"
+    )
+    return parser.parse_args()
+
+
+def apply_args(args):
+    global UDP_IP, UDP_PORT, UDP_ENABLED
+    global PHYSICAL_REMAP_ENABLED, SCREEN_PHYS_W, SCREEN_PHYS_H, FRAME_PHYS_W, FRAME_PHYS_H
+    global UDP_X_SQUEEZE, UDP_Y_SQUEEZE
+
+    UDP_IP = args.udp_ip
+    UDP_PORT = args.udp_port
+    UDP_ENABLED = not args.no_udp
+    UDP_X_SQUEEZE = args.x_squeeze
+    UDP_Y_SQUEEZE = args.y_squeeze
+
+    if args.screen_phys or args.frame_phys:
+        if not (args.screen_phys and args.frame_phys):
+            raise SystemExit("Use --screen-phys W H and --frame-phys W H together.")
+        SCREEN_PHYS_W, SCREEN_PHYS_H = args.screen_phys
+        FRAME_PHYS_W, FRAME_PHYS_H = args.frame_phys
+        PHYSICAL_REMAP_ENABLED = True
+
+
 def main():
     global capture_hwnd, render_hwnd
+
+    args = parse_args()
+    apply_args(args)
 
     capture_hwnd = create_capture_window()
     render_hwnd = create_render_window()
@@ -408,6 +504,16 @@ def main():
     print("Visible debug window remaps touches into its own bounds")
     print(f"Drawing connection lines for dots within {LINE_DISTANCE_THRESHOLD}px")
     print(f"UDP output: {UDP_IP}:{UDP_PORT} enabled={UDP_ENABLED}")
+    if PHYSICAL_REMAP_ENABLED:
+        print(
+            "Physical remap enabled: "
+            f"screen={SCREEN_PHYS_W}x{SCREEN_PHYS_H}, "
+            f"frame={FRAME_PHYS_W}x{FRAME_PHYS_H}, "
+            f"scale=({FRAME_PHYS_W / SCREEN_PHYS_W:.6f}, {FRAME_PHYS_H / SCREEN_PHYS_H:.6f})"
+        )
+    else:
+        print("Physical remap disabled")
+    print(f"Legacy squeeze: x={UDP_X_SQUEEZE}, y={UDP_Y_SQUEEZE}")
     print("Ctrl+Shift+T toggles capture ON/OFF")
     print("Esc in the debug window turns capture OFF")
 

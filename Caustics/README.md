@@ -1,4 +1,4 @@
-# Rock & Water Tracker
+# Caustics Demo
 
 Real-time caustics demo, written in GLSL and running standalone in python with pygame and pygame_gui
 
