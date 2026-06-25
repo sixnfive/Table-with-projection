@@ -5,6 +5,7 @@ import traceback
 import socket
 import struct
 import argparse
+import time
 import win32con
 import win32gui
 
@@ -25,6 +26,13 @@ LINE_DISTANCE_THRESHOLD = 380  # render-window pixels
 UDP_IP = "127.0.0.1"
 UDP_PORT = 5005
 UDP_ENABLED = True
+
+# UDP send cadence. Default is event-driven: one packet per WM_TOUCH bundle.
+# --uncapped repeats the latest active_touches as fast as the message pump allows.
+# --hz N repeats at a fixed rate.
+UDP_UNCAPPED = False
+UDP_HZ = 0.0
+SEND_UDP_ON_TOUCH_EVENTS = True
 
 # Physical remap. Units can be mm, cm, inches, whatever — just be consistent.
 # If the touch frame is larger than the visible screen and top-left aligned,
@@ -191,8 +199,6 @@ def update_touch(ti):
     if render_hwnd:
         InvalidateRect(render_hwnd, None, False)
 
-    send_udp_objects()
-
 
 def get_render_dots(hwnd):
     client_rect = win32gui.GetClientRect(hwnd)
@@ -232,37 +238,21 @@ def get_render_dots(hwnd):
 
 def capture_wnd_proc(hwnd, msg, wparam, lparam):
     try:
-
         if msg == WM_TOUCH:
-
             count = wparam & 0xFFFF
-
             inputs = (TOUCHINPUT * count)()
 
-            ok = GetTouchInputInfo(
-                lparam,
-                count,
-                inputs,
-                ctypes.sizeof(TOUCHINPUT)
-            )
-
+            ok = GetTouchInputInfo(lparam, count, inputs, ctypes.sizeof(TOUCHINPUT))
             if ok:
-
-                # update all touches first
+                # Update the whole Windows touch bundle first, then send exactly
+                # one UDP packet for the completed state. This preserves simultaneity.
                 for ti in inputs:
                     update_touch(ti)
 
-                # debug what Windows actually delivered
-                print(
-                    f"frame count={count} "
-                    f"active={list(active_touches.keys())}"
-                )
-
-                # send ONE udp packet per frame
-                send_udp_objects()
+                if SEND_UDP_ON_TOUCH_EVENTS:
+                    send_udp_objects()
 
             CloseTouchInputHandle(lparam)
-
             return 0
 
         return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
@@ -452,6 +442,14 @@ def parse_args():
     parser.add_argument("--udp-ip", default=UDP_IP)
     parser.add_argument("--udp-port", type=int, default=UDP_PORT)
     parser.add_argument("--no-udp", action="store_true")
+    parser.add_argument(
+        "--uncapped", action="store_true",
+        help="Send UDP packets continuously as fast as possible using the latest touch state."
+    )
+    parser.add_argument(
+        "--hz", type=float, default=0.0,
+        help="Send UDP continuously at a fixed rate, e.g. --hz 1000. Overrides event-only sending."
+    )
 
     parser.add_argument(
         "--screen-phys", nargs=2, type=float, metavar=("W", "H"),
@@ -474,12 +472,19 @@ def parse_args():
 
 def apply_args(args):
     global UDP_IP, UDP_PORT, UDP_ENABLED
+    global UDP_UNCAPPED, UDP_HZ, SEND_UDP_ON_TOUCH_EVENTS
     global PHYSICAL_REMAP_ENABLED, SCREEN_PHYS_W, SCREEN_PHYS_H, FRAME_PHYS_W, FRAME_PHYS_H
     global UDP_X_SQUEEZE, UDP_Y_SQUEEZE
 
     UDP_IP = args.udp_ip
     UDP_PORT = args.udp_port
     UDP_ENABLED = not args.no_udp
+    UDP_UNCAPPED = bool(args.uncapped)
+    UDP_HZ = max(0.0, float(args.hz))
+
+    # In continuous modes, the loop sends packets. Do not also send inside WM_TOUCH.
+    SEND_UDP_ON_TOUCH_EVENTS = not (UDP_UNCAPPED or UDP_HZ > 0.0)
+
     UDP_X_SQUEEZE = args.x_squeeze
     UDP_Y_SQUEEZE = args.y_squeeze
 
@@ -489,6 +494,51 @@ def apply_args(args):
         SCREEN_PHYS_W, SCREEN_PHYS_H = args.screen_phys
         FRAME_PHYS_W, FRAME_PHYS_H = args.frame_phys
         PHYSICAL_REMAP_ENABLED = True
+
+
+
+def run_message_loop():
+    """Run either the normal blocking Windows message pump or a UDP send loop.
+
+    Default mode uses PumpMessages(), so UDP sends happen only when WM_TOUCH arrives.
+    --uncapped and --hz use PumpWaitingMessages() so we can keep transmitting the
+    latest active touch state even when Windows has no new touch message.
+    """
+    if not UDP_UNCAPPED and UDP_HZ <= 0.0:
+        run_message_loop()
+        return
+
+    if UDP_UNCAPPED:
+        print("UDP continuous send mode: UNCAPPED")
+        while True:
+            if win32gui.PumpWaitingMessages():
+                break
+            send_udp_objects()
+            # Yield to the OS without intentionally rate-limiting. Remove this only
+            # if you truly want to peg a CPU core.
+            time.sleep(0)
+        return
+
+    interval = 1.0 / UDP_HZ
+    next_send = time.perf_counter()
+    print(f"UDP continuous send mode: {UDP_HZ:.3f} Hz")
+
+    while True:
+        if win32gui.PumpWaitingMessages():
+            break
+
+        now = time.perf_counter()
+        if now >= next_send:
+            send_udp_objects()
+            # Avoid death-spiral if the app is paused/stalled.
+            if now - next_send > interval * 4:
+                next_send = now + interval
+            else:
+                next_send += interval
+        else:
+            sleep_for = min(0.001, next_send - now)
+            if sleep_for > 0:
+                time.sleep(sleep_for)
 
 
 def main():
@@ -504,6 +554,12 @@ def main():
     print("Visible debug window remaps touches into its own bounds")
     print(f"Drawing connection lines for dots within {LINE_DISTANCE_THRESHOLD}px")
     print(f"UDP output: {UDP_IP}:{UDP_PORT} enabled={UDP_ENABLED}")
+    if UDP_UNCAPPED:
+        print("UDP cadence: uncapped continuous latest-state packets")
+    elif UDP_HZ > 0.0:
+        print(f"UDP cadence: fixed continuous latest-state packets at {UDP_HZ:.3f} Hz")
+    else:
+        print("UDP cadence: event-driven, one packet per WM_TOUCH bundle")
     if PHYSICAL_REMAP_ENABLED:
         print(
             "Physical remap enabled: "
@@ -517,7 +573,7 @@ def main():
     print("Ctrl+Shift+T toggles capture ON/OFF")
     print("Esc in the debug window turns capture OFF")
 
-    win32gui.PumpMessages()
+    run_message_loop()
 
 
 if __name__ == "__main__":
