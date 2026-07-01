@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse, array, socket, struct, time
+import argparse, array, socket, struct, time, threading
 from collections import defaultdict
 import tkinter as tk
 from tkinter import ttk
@@ -128,133 +128,147 @@ void mainImage(out vec4 Q, in vec2 U){
 }
 '''
 class UDPObjectReceiver:
-    def __init__(self, port, max_objects, timeout_seconds=.5):
-        self.max_objects=max_objects; self.timeout_seconds=timeout_seconds; self.tracks={}
+    def __init__(self, port, max_objects, timeout_seconds=.5, recv_buffer_bytes=4*1024*1024):
+        self.max_objects=max_objects
+        self.timeout_seconds=timeout_seconds
+        self.tracks={}
+        self.lock=threading.Lock()
+        self.running=True
+
         self.stats_packets=0
         self.stats_short=0
         self.stats_updates=defaultdict(int)
         self.stats_latest={}
         self.stats_last_print=time.perf_counter()
-        self.sock=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); self.sock.bind(('0.0.0.0',port)); self.sock.setblocking(False)
-        print(f'Listening for UDP objects on 0.0.0.0:{port}')
+
+        self.sock=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+        try:
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, int(recv_buffer_bytes))
+        except OSError:
+            pass
+        self.sock.bind(('0.0.0.0',port))
+        self.sock.settimeout(0.25)
+
+        self.thread=threading.Thread(target=self._recv_loop, daemon=True)
+        self.thread.start()
+
+        print(f'Listening for UDP objects on 0.0.0.0:{port} in dedicated receiver thread')
+        try:
+            actual_buf = self.sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+            print(f'UDP receive buffer: {actual_buf} bytes')
+        except OSError:
+            pass
+
+    def close(self):
+        self.running=False
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+    def _recv_loop(self):
+        recsize=struct.calcsize('<Hfff')
+        while self.running:
+            try:
+                packet,_=self.sock.recvfrom(65535)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+            now=time.perf_counter()
+
+            if len(packet)<1:
+                continue
+
+            count=packet[0]
+            expected=1+count*recsize
+
+            with self.lock:
+                self.stats_packets += 1
+
+                if len(packet)<expected:
+                    self.stats_short += 1
+                    continue
+
+                off=1
+                for _ in range(count):
+                    oid,x,y,rot=struct.unpack_from('<Hfff',packet,off)
+                    off+=recsize
+
+                    x=min(max(float(x),0.),1.)
+                    y=min(max(float(y),0.),1.)
+
+                    self.stats_updates[oid] += 1
+                    self.stats_latest[oid] = (x,y,float(rot),now)
+
+                    p=self.tracks.get(oid)
+                    if p is None:
+                        self.tracks[oid]={
+                            'x':x,'y':y,
+                            'px':x,'py':y,
+                            'accum_dx':0.0,'accum_dy':0.0,
+                            'rot':float(rot),
+                            'last':now
+                        }
+                    else:
+                        dx=x-p['x']
+                        dy=y-p['y']
+                        p['accum_dx']=p.get('accum_dx',0.0)+dx
+                        p['accum_dy']=p.get('accum_dy',0.0)+dy
+                        p.update(px=p['x'],py=p['y'],x=x,y=y,rot=float(rot),last=now)
+
+                stale=[oid for oid,t in self.tracks.items() if now-t['last']>self.timeout_seconds]
+                for oid in stale:
+                    del self.tracks[oid]
+
     def poll(self):
-        now=time.perf_counter(); recsize=struct.calcsize('<Hfff')
-        while True:
-            try: packet,_=self.sock.recvfrom(65535)
-            except BlockingIOError: break
-            self.stats_packets += 1
-            if len(packet)<1: continue
-            count=packet[0]; expected=1+count*recsize
-            if len(packet)<expected: self.stats_short += 1; print(f'Ignoring short UDP packet: got {len(packet)}, expected {expected}'); continue
-            off=1
-            for _ in range(count):
-                oid,x,y,rot=struct.unpack_from('<Hfff',packet,off); off+=recsize
-                x=min(max(float(x),0.),1.); y=min(max(float(y),0.),1.)
-                self.stats_updates[oid] += 1
-                self.stats_latest[oid] = (x,y,float(rot),now)
-                p=self.tracks.get(oid)
-                if p is None: self.tracks[oid]={'x':x,'y':y,'px':x,'py':y,'accum_dx':0.0,'accum_dy':0.0,'rot':float(rot),'last':now}
-                else:
-                    dx=x-p['x']; dy=y-p['y']
-                    p['accum_dx']=p.get('accum_dx',0.0)+dx
-                    p['accum_dy']=p.get('accum_dy',0.0)+dy
-                    p.update(px=p['x'],py=p['y'],x=x,y=y,rot=float(rot),last=now)
-        for oid in [oid for oid,t in self.tracks.items() if now-t['last']>self.timeout_seconds]: del self.tracks[oid]
+        # Compatibility no-op. The receiver thread is doing the work.
+        pass
+
     def debug_print(self, interval=1.0):
         now=time.perf_counter()
-        if now-self.stats_last_print < interval:
-            return
-        dt=max(now-self.stats_last_print,1e-6)
-        active=sorted(self.tracks.keys())
-        print("="*72)
-        print(f"UDP packets/sec: {self.stats_packets/dt:7.1f} | objects: {len(active)} {active[:24]}")
-        print(f"short packets: {self.stats_short}")
-        for oid in active[:24]:
-            hz=self.stats_updates.get(oid,0)/dt
-            x,y,rot,t=self.stats_latest.get(oid,(0,0,0,0))
-            age=now-t
-            tr=self.tracks.get(oid,{})
-            adx=tr.get('accum_dx',0.0); ady=tr.get('accum_dy',0.0)
-            print(f"id {oid:5d} | {hz:6.1f} Hz | age {age:5.3f}s | x {x: .4f} y {y: .4f} | accum dx {adx:+.5f} dy {ady:+.5f} | rot {rot:+.3f}")
-        if len(active)>24:
-            print(f"... {len(active)-24} more ids")
-        self.stats_packets=0
-        self.stats_short=0
-        self.stats_updates.clear()
-        self.stats_last_print=now
+        with self.lock:
+            if now-self.stats_last_print < interval:
+                return
+            dt=max(now-self.stats_last_print,1e-6)
+            active=sorted(self.tracks.keys())
+            print("="*72)
+            print(f"UDP packets/sec: {self.stats_packets/dt:7.1f} | objects: {len(active)} {active[:24]}")
+            print(f"short packets: {self.stats_short}")
+            for oid in active[:24]:
+                hz=self.stats_updates.get(oid,0)/dt
+                x,y,rot,t=self.stats_latest.get(oid,(0,0,0,0))
+                age=now-t
+                tr=self.tracks.get(oid,{})
+                adx=tr.get('accum_dx',0.0)
+                ady=tr.get('accum_dy',0.0)
+                print(f"id {oid:5d} | {hz:6.1f} Hz | age {age:5.3f}s | x {x: .4f} y {y: .4f} | accum dx {adx:+.5f} dy {ady:+.5f} | rot {rot:+.3f}")
+            if len(active)>24:
+                print(f"... {len(active)-24} more ids")
+
+            self.stats_packets=0
+            self.stats_short=0
+            self.stats_updates.clear()
+            self.stats_last_print=now
 
     def make_texture_data(self,w,h):
-        arr=np.full((1,self.max_objects,4),-1.,dtype=np.float32); active=sorted(self.tracks.items(),key=lambda kv:kv[0])[:self.max_objects]
-        for i,(_,o) in enumerate(active):
-            # Upload current position plus an artificial previous position based on
-            # all motion accumulated since the last rendered frame. This prevents
-            # high-rate UDP packets from overwriting tiny per-packet deltas.
-            px = o['x'] - o.get('accum_dx',0.0)
-            py = o['y'] - o.get('accum_dy',0.0)
-            arr[0,i,:]=(o['x']*w,(1-o['y'])*h,px*w,(1-py)*h)
-            o['accum_dx']=0.0
-            o['accum_dy']=0.0
-        return arr,len(active)
+        arr=np.full((1,self.max_objects,4),-1.,dtype=np.float32)
 
-def apply_velocity_multiplier_to_object_data(arr, multiplier):
-    if abs(multiplier - 1.0) < 1e-6:
-        return arr
-    out = arr.copy()
-    valid = (
-        (out[0,:,0] >= 0.0) &
-        (out[0,:,1] >= 0.0) &
-        (out[0,:,2] >= 0.0) &
-        (out[0,:,3] >= 0.0)
-    )
-    cur = out[0,valid,0:2].copy()
-    prev = out[0,valid,2:4].copy()
-    out[0,valid,2:4] = cur - (cur - prev) * multiplier
-    return out
+        with self.lock:
+            active=sorted(self.tracks.items(),key=lambda kv:kv[0])[:self.max_objects]
 
-class PingPong:
-    def __init__(self,ctx,size):
-        self.ctx=ctx; self.tex=[self.mk(size),self.mk(size)]; self.fbo=[ctx.framebuffer(color_attachments=[self.tex[0]]),ctx.framebuffer(color_attachments=[self.tex[1]])]; self.read=0; self.write=1
-    def mk(self,size):
-        t=self.ctx.texture(size,4,dtype='f4'); t.filter=(moderngl.LINEAR,moderngl.LINEAR); t.repeat_x=False; t.repeat_y=False; return t
-    @property
-    def src(self): return self.tex[self.read]
-    @property
-    def dst_fbo(self): return self.fbo[self.write]
-    def swap(self): self.read,self.write=self.write,self.read
-    def clear(self):
-        for f in self.fbo: f.use(); self.ctx.clear(0,0,0,0)
-    def release(self):
-        for f in self.fbo: f.release()
-        for t in self.tex: t.release()
+            for i,(_,o) in enumerate(active):
+                px=o['x']-o.get('accum_dx',0.0)
+                py=o['y']-o.get('accum_dy',0.0)
+                arr[0,i,:]=(o['x']*w,(1-o['y'])*h,px*w,(1-py)*h)
 
+                o['accum_dx']=0.0
+                o['accum_dy']=0.0
 
-class SingleTarget:
-    def __init__(self, ctx, size):
-        self.ctx = ctx
-        self.tex = self.mk(size)
-        self.fbo = ctx.framebuffer(color_attachments=[self.tex])
+            count=len(active)
 
-    def mk(self, size):
-        t = self.ctx.texture(size, 4, dtype="f4")
-        t.filter = (moderngl.LINEAR, moderngl.LINEAR)
-        t.repeat_x = False
-        t.repeat_y = False
-        return t
-
-    def release(self):
-        self.fbo.release()
-        self.tex.release()
-def bind(p,name,tex,unit):
-    tex.use(location=unit)
-    if name in p: p[name].value=unit
-def uniforms(p,w,h,t,dt,frame,mouse):
-    if 'iResolution' in p: p['iResolution'].value=(float(w),float(h),1.)
-    if 'iTime' in p: p['iTime'].value=float(t)
-    if 'iTimeDelta' in p: p['iTimeDelta'].value=float(dt)
-    if 'iFrame' in p: p['iFrame'].value=int(frame)
-    if 'iMouse' in p: p['iMouse'].value=tuple(float(x) for x in mouse)
-def vao(ctx,p,vbo): return ctx.vertex_array(p,[(vbo,'2f','in_pos')])
-def upsample_mode(name): return {'linear':0,'catmull':1,'lanczos':2}[name]
+        return arr,count
 
 class ControlPanel:
     def __init__(self, args, on_reset):
@@ -360,7 +374,7 @@ class ControlPanel:
             self.visible = True
 
 def main():
-    ap=argparse.ArgumentParser(); ap.add_argument('--port',type=int,default=5005); ap.add_argument('--max-objects',type=int,default=256); ap.add_argument('--no-mouse',action='store_true')
+    ap=argparse.ArgumentParser(); ap.add_argument('--port',type=int,default=5005); ap.add_argument('--max-objects',type=int,default=256); ap.add_argument('--udp-recv-buffer',type=int,default=4*1024*1024); ap.add_argument('--no-mouse',action='store_true')
     ap.add_argument('--sim-scale',type=float,default=1.0); ap.add_argument('--speed',type=float,default=1.0); ap.add_argument('--dissipation',type=float,default=0.995); ap.add_argument('--caustic-persistence',type=float,default=0.5)
     ap.add_argument('--upsample',choices=['linear','catmull','lanczos'],default='catmull'); ap.add_argument('--no-center-emitter',action='store_true'); ap.add_argument('--object-radius',type=float,default=8.0); ap.add_argument('--object-strength',type=float,default=18.0); ap.add_argument('--mouse-radius',type=float,default=4.0); ap.add_argument('--mouse-strength',type=float,default=12.0); ap.add_argument('--debug-objects',action='store_true'); ap.add_argument('--velocity-multiplier',type=float,default=1.0); ap.add_argument('--udp-debug',action='store_true'); ap.add_argument('--udp-debug-interval',type=float,default=1.0)
     args=ap.parse_args()
@@ -368,8 +382,8 @@ def main():
     if args.sim_scale<=0: raise SystemExit('--sim-scale must be > 0')
     if not (0<=args.caustic_persistence<=1): raise SystemExit('--caustic-persistence must be between 0 and 1')
     pygame.init(); pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION,3); pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION,3); pygame.display.gl_set_attribute(pygame.GL_CONTEXT_PROFILE_MASK,pygame.GL_CONTEXT_PROFILE_CORE)
-    w,h=DEFAULT_WIDTH,DEFAULT_HEIGHT; pygame.display.set_mode((w,h),pygame.OPENGL|pygame.DOUBLEBUF|pygame.RESIZABLE); pygame.display.set_caption('WdBGDm caustics - UDP object input v2.9 accumulated motion')
-    ctx=moderngl.create_context(); ctx.enable_only(moderngl.NOTHING); recv=UDPObjectReceiver(args.port,args.max_objects)
+    w,h=DEFAULT_WIDTH,DEFAULT_HEIGHT; pygame.display.set_mode((w,h),pygame.OPENGL|pygame.DOUBLEBUF|pygame.RESIZABLE); pygame.display.set_caption('WdBGDm caustics - UDP object input v3.0 threaded UDP')
+    ctx=moderngl.create_context(); ctx.enable_only(moderngl.NOTHING); recv=UDPObjectReceiver(args.port,args.max_objects, recv_buffer_bytes=args.udp_recv_buffer)
     vbo=ctx.buffer(array.array('f',[-1,-1,1,-1,-1,1,1,1]).tobytes())
     programs={'A':ctx.program(vertex_shader=VERT,fragment_shader=shader(BUFFER_A.replace('__MAX_OBJECTS__',str(args.max_objects)))),'B':ctx.program(vertex_shader=VERT,fragment_shader=shader(BUFFER_B)),'C':ctx.program(vertex_shader=VERT,fragment_shader=shader(BUFFER_C)),'Image':ctx.program(vertex_shader=VERT,fragment_shader=shader(IMAGE.replace('__MAX_OBJECTS__',str(args.max_objects))))}
     vaos={k:vao(ctx,p,vbo) for k,p in programs.items()}; empty=ctx.texture((1,1),4,dtype='f4'); empty.filter=(moderngl.NEAREST,moderngl.NEAREST)
@@ -429,6 +443,7 @@ def main():
             p=programs['A']; bufs['A'].dst_fbo.use(); ctx.viewport=(0,0,sw,sh); uniforms(p,sw,sh,t,dt,frame,mouse_sim); p['uObjectCount'].value=int(count); p['uUseMouse'].value=1 if panel.flag_mouse() else 0; p['uCenterEmitter'].value=1 if panel.flag_center_emitter() else 0; p['uDissipation'].value=panel.value('dissipation'); p['uObjectRadius'].value=panel.value('object_radius'); p['uObjectStrength'].value=panel.value('object_strength'); p['uMouseRadius'].value=panel.value('mouse_radius'); p['uMouseStrength'].value=panel.value('mouse_strength'); p['uVelocityMultiplier'].value=1.0; bind(p,'iChannel0',bufs['A'].src,0); bind(p,'iChannel1',bufs['B'].src,1); bind(p,'iChannel2',empty,2); bind(p,'iChannel3',objtex,3); vaos['A'].render(moderngl.TRIANGLE_STRIP); bufs['A'].swap()
             p=programs['C']; bufs['C'].dst_fbo.use(); ctx.viewport=(0,0,sw,sh); uniforms(p,sw,sh,t,dt,frame,mouse_sim); p['uCausticPersistence'].value=panel.value('caustic_persistence'); bind(p,'iChannel0',bufs['A'].src,0); bind(p,'iChannel1',bufs['B'].src,1); bind(p,'iChannel2',bufs['C'].src,2); bind(p,'iChannel3',empty,3); vaos['C'].render(moderngl.TRIANGLE_STRIP); bufs['C'].swap()
         ctx.screen.use(); ctx.viewport=(0,0,w,h); ctx.clear(0,0,0,1); p=programs['Image']; uniforms(p,w,h,t,dt,frame,mouse_screen); p['uSimResolution'].value=(float(sw),float(sh)); p['uUpsampleMode'].value=upsample_mode(panel.upsample()); p['uDebugObjects'].value=1 if panel.flag_debug_objects() else 0; p['uObjectCount'].value=int(count); bind(p,'iChannel0',bufs['A'].src,0); bind(p,'iChannel1',bufs['B'].src,1); bind(p,'iChannel2',bufs['C'].src,2); bind(p,'iChannel3',objtex,3); vaos['Image'].render(moderngl.TRIANGLE_STRIP); pygame.display.flip()
+    recv.close()
     pygame.quit()
 if __name__=='__main__': main()
 
